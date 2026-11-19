@@ -8,9 +8,9 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 p = argparse.ArgumentParser()
-p.add_argument('csv', nargs='?', default='results/benchmarks.csv')
+p.add_argument('csv', nargs='*', default=['results/benchmarks.csv'])
 a = p.parse_args()
-df = pd.read_csv(a.csv)
+df = pd.concat([pd.read_csv(path) for path in a.csv], ignore_index=True)
 out = Path('results/plots')
 out.mkdir(parents=True, exist_ok=True)
 if df.empty:
@@ -18,14 +18,17 @@ if df.empty:
 df['cores'] = df.ranks * df.threads
 d = df.groupby(['size', 'mode', 'ranks', 'threads', 'tile', 'cores'], as_index=False)[['total_s', 'compute_s', 'comm_s']].median()
 for n, group in d.groupby('size'):
-    base = group[(group['mode'] == 'seq_tiled') & (group['tile'] == 64)]['total_s']
-    baseline = float(base.iloc[0]) if len(base) else float(group[group['mode'] == 'seq_tiled']['total_s'].min())
+    baseline = float(group[group['mode'] == 'seq_tiled']['total_s'].min())
     group = group.copy()
     group['speedup'] = baseline / group.total_s
     group['efficiency'] = group.speedup / group.cores
+    plotted = pd.concat([
+        group[(group['mode'] != 'seq_tiled') & (group['tile'] == 64)],
+        group[group['mode'] == 'seq_tiled'].sort_values('total_s').drop_duplicates('cores')
+    ])
     for metric, ylabel in [('total_s', 'Time (s)'), ('speedup', 'Speedup'), ('efficiency', 'Efficiency')]:
         fig, ax = plt.subplots(figsize=(7, 4.5))
-        for mode, g in group[group['tile'] == 64].groupby('mode'):
+        for mode, g in plotted.groupby('mode'):
             best = g.groupby('cores', as_index=False)[metric].min() if metric == 'total_s' else g.groupby('cores', as_index=False)[metric].max()
             ax.plot(best.cores, best[metric], 'o-', label=mode)
         if metric == 'speedup':

@@ -15,20 +15,24 @@ p.add_argument('--quick', action='store_true')
 p.add_argument('--repeats', type=int, default=5)
 p.add_argument('--steps', type=int)
 p.add_argument('--sizes', type=int, nargs='*')
+p.add_argument('--cores', type=int, nargs='*', help='limit total core counts')
+p.add_argument('--modes', nargs='*', help='limit solver modes')
+p.add_argument('--tiles', type=int, nargs='*', help='limit sequential tile sweep')
 p.add_argument('--output', default='results/benchmarks.csv')
 a = p.parse_args()
 cores = os.cpu_count() or 1
 sizes = a.sizes or ([128, 256] if a.quick else [2048, 4096, 8192])
 steps = a.steps if a.steps is not None else (10 if a.quick else 1000)
-splits = [c for c in (1, 2, 4, 8, 16) if c <= cores]
-tiles = (32, 64) if a.quick else (32, 64, 128, 256)
+splits = [c for c in (a.cores or (1, 2, 4, 8, 16)) if c <= cores]
+tiles = a.tiles or ((32, 64) if a.quick else (32, 64, 128, 256))
 env = os.environ.copy()
-env.update(OMP_PROC_BIND='close', OMP_PLACES='cores')
+if os.name != 'nt':
+    env.update(OMP_PROC_BIND='close', OMP_PLACES='cores')
 path = pathlib.Path(a.output)
 path.parent.mkdir(parents=True, exist_ok=True)
 fields = ['timestamp_utc', 'mode', 'size', 'steps', 'ranks', 'threads', 'tile', 'repeat',
           'init_s', 'comm_s', 'compute_s', 'total_s', 'gflops', 'updates_per_s',
-          'sum', 'mean', 'min', 'max', 'center', 'verify_error', 'analytic_error']
+          'sum', 'mean', 'min', 'max', 'center', 'sample_error', 'verify_error', 'analytic_error']
 
 def measure(n, mode, ranks, threads, tile):
     command = [a.mpirun, '-np', str(ranks), a.binary, '--size', str(n), '--steps', str(steps),
@@ -59,6 +63,8 @@ with path.open('w', newline='') as handle:
                 for mode in ('hybrid', 'hybrid_overlap'):
                     configs.append((mode, ranks, c // ranks, 64))
         for mode, ranks, threads, tile in dict.fromkeys(configs):
+            if a.modes and mode not in a.modes:
+                continue
             print(f'{n} {mode} {ranks}x{threads} tile={tile}', flush=True)
             for row in measure(n, mode, ranks, threads, tile):
                 writer.writerow(row)
