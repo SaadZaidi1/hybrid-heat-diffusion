@@ -1,0 +1,9 @@
+build/
+*.exe
+*.obj
+*.o
+*.pdb
+__pycache__/
+*.pyc
+results/dumps/
+*.npy
