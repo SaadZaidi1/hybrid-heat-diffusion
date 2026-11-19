@@ -35,6 +35,8 @@ cmake --build build -j
 
 The default binary is `build/heat`. Compilation uses `-O3 -march=native -Wall -Wextra` with GNU/Clang. For portable binaries, remove `-march=native` from CMake options.
 
+The measured Windows build used MSYS2 UCRT64 GCC, CMake, and Microsoft MPI plus its SDK. Configure from PowerShell after adding `C:\msys64\ucrt64\bin` and `C:\Program Files\Microsoft MPI\Bin` to `PATH` and setting `MSMPI_INC` and `MSMPI_LIB64` to the SDK's `Include` and `Lib\x64` directories, respectively. Use `cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release`, then `cmake --build build`.
+
 ## Run
 
 ```bash
@@ -59,13 +61,33 @@ python3 scripts/verify.py --binary build/heat
 python3 scripts/benchmark.py --binary build/heat --quick --repeats 2
 python3 scripts/benchmark.py --binary build/heat --repeats 5
 python3 scripts/plot_results.py results/benchmarks.csv
+python3 scripts/plot_heatmaps.py --binary build/heat
 ```
 
-`verify.py` compares every version against an independent sequential reference to relative tolerance `1e-10`, including uneven strips and a 1024² case, and checks the exact discrete sine-mode decay. The benchmark runner detects logical CPU count, runs a warmup before each configuration, sweeps core splits and tile sizes, and writes only measured results to `results/benchmarks.csv`. The full sweep includes 2048², 4096², and 8192², while `--quick` uses 128² and 256². The naive version runs only on the smallest grid. The plotting script reads the measured CSV and creates time, speedup, efficiency, split, overlap, breakdown, and tile plots in `results/plots/`.
+`verify.py` compares every version against an independent sequential reference to relative tolerance `1e-10`, including uneven strips and a 1024² case, and checks the exact discrete sine-mode decay and total heat decay. The benchmark runner detects logical CPU count, runs a warmup before each configuration, sweeps core splits and tile sizes, and writes only measured results to CSV. The full sweep includes 2048², 4096², and 8192², while `--quick` uses 128² and 256². The naive version runs only on the smallest grid. Use `--cores`, `--modes`, `--tiles`, `--sizes`, and `--steps` to limit a sweep. The plotting script reads one or more measured CSVs and creates time, speedup, efficiency, split, overlap, breakdown, and tile plots in `results/plots/`. `plot_heatmaps.py` runs a small grid at 0, 50, and 200 steps to make a field visualization.
 
-## Results and limits
+## Measured results
 
-Measurement results and this machine's specifications will be added after the local toolchain is available and benchmark runs complete. Do not treat unmeasured configurations as results. Expected limits to examine are communication per strip, cache behavior and memory bandwidth, unequal strip sizes, and MPI/OpenMP startup and scheduling overhead. On large grids, compare speedup against the single-thread tiled implementation.
+The local machine was an AMD Ryzen 5 3600 (6 physical cores, 12 logical), 7.93 GiB RAM, Windows 11 Pro, GCC 16.2.0 (MSYS2 UCRT64), Microsoft MPI 10.1.12498.52, and CMake 4.4.4. These measurements were taken on Windows for development; the project targets Linux with OpenMPI or MPICH. Timing is the median of the measured repetitions and includes array initialization, scatter, all stencil steps, and final gather. The 128² and 256² quick sweeps have five repetitions; the 2048² sweep has two; the 4096² and 8192² sweeps have one. Each configuration also had one unrecorded warmup. The tuned baseline is the fastest measured single-thread tiled run for that size.
+
+| Grid | Steps | Best sequential tile | Baseline time | Fastest run with ≥2 cores | Time | Speedup |
+|---:|---:|---:|---:|---|---:|---:|
+| 128² | 10 | 64 | 0.000454 s | MPI 2×1 | 0.000922 s | 0.49× |
+| 256² | 10 | 64 | 0.001536 s | MPI 2×1 | 0.001873 s | 0.82× |
+| 2048² | 100 | 256 | 0.723145 s | MPI 4×1 | 0.608636 s | 1.19× |
+| 4096² | 20 | 256 | 0.905827 s | MPI 2×1 | 0.834966 s | 1.08× |
+| 8192² | 5 | 256 | 2.133336 s | hybrid overlap 2×2 | 2.191422 s | 0.97× |
+
+All 381 measured rows are in [`results/benchmarks.csv`](results/benchmarks.csv), with the source sweeps retained as separate CSVs. The sum was identical across implementations for each grid and step count (for example, about 20,789,890 at 2048²/100 steps), and sampled final-step stencil checks passed for runs made after that check was added. The full numerical regression suite passed with a maximum reported relative error of zero at the printed precision.
+
+![2048 execution time](results/plots/2048_total_s.png)
+![2048 speedup](results/plots/2048_speedup.png)
+![8192 overlap comparison](results/plots/8192_overlap.png)
+![Heat maps](results/plots/heatmaps.png)
+
+The plotted data shows that tiny grids lose time to rank and thread overhead. At 2048², four MPI ranks were fastest among the tested parallel splits. A 2×2 hybrid run took 0.707 s without overlap and 0.773 s with overlap, so overlap did not help at this size and step count. Each rank exchanges two rows per step; with fewer owned rows, that exchange and OpenMP scheduling take a larger share of useful work. Tiling at 256 was faster than 64 in the sequential sweeps, consistent with cache and memory bandwidth effects, though the short runs and Windows runtime noise limit broad conclusions. Uneven partitions are numerically tested at 131 rows with three ranks but were not benchmarked separately.
+
+The 8192² single-rank run initially failed the conservative available-memory guard while RAM was occupied; it succeeded when memory became available. The 16384² case and the requested 1000-step large-grid sweeps were not measured on this 7.93 GiB machine. The 8192² data has only five steps and one repetition, so it primarily measures initialization and gather overhead; it is not evidence of steady-state scalability. No times or speedups are extrapolated for unrun configurations. To reproduce the plots: `python3 scripts/plot_results.py results/benchmarks.csv`.
 
 ## Files
 
@@ -73,6 +95,7 @@ Measurement results and this machine's specifications will be added after the lo
 - `scripts/verify.py`: numerical regression and analytic test.
 - `scripts/benchmark.py`: warmup, repeated measurements and sweep.
 - `scripts/plot_results.py`: graphs generated from CSV.
+- `scripts/plot_heatmaps.py`: small-grid temperature visualizations.
 - `results/`: measured CSV and plots.
 
 MIT licensed; see [LICENSE](LICENSE).
