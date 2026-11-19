@@ -2,6 +2,7 @@
 """End-to-end regression tests using the built executable and MPI launcher."""
 import argparse
 import json
+import math
 import os
 import subprocess
 
@@ -10,7 +11,8 @@ p.add_argument('--binary', default='build/heat')
 p.add_argument('--mpirun', default='mpirun')
 a = p.parse_args()
 env = os.environ.copy()
-env.update(OMP_PROC_BIND='close', OMP_PLACES='cores')
+if os.name != 'nt':
+    env.update(OMP_PROC_BIND='close', OMP_PLACES='cores')
 
 def run(ranks, mode, n, steps, threads=1, init='hotspots', extra=()):
     cmd = [a.mpirun, '-np', str(ranks), a.binary, '--mode', mode, '--size', str(n),
@@ -18,7 +20,7 @@ def run(ranks, mode, n, steps, threads=1, init='hotspots', extra=()):
            '--verify', *extra]
     result = subprocess.run(cmd, check=True, text=True, capture_output=True, env=env)
     data = json.loads(next(line for line in result.stdout.splitlines() if line.startswith('{')))
-    assert data['verified'] and data['verify_error'] <= 1e-10, (cmd, data)
+    assert data['verified'] and data['verify_error'] <= 1e-10 and data['sample_error'] <= 1e-10, (cmd, data)
     print(f"PASS {mode:15} {n:4} {ranks}x{threads} {init:8} error={data['verify_error']:.2e}")
     return data
 
@@ -32,4 +34,8 @@ for ranks, threads in ((1, 4), (2, 2), (4, 1)):
 run(2, 'hybrid_overlap', 1024, 3, 2)
 analytic = run(3, 'hybrid_overlap', 127, 25, 2, 'sine')
 assert analytic['analytic_error'] < 1e-10, analytic
+initial = run(1, 'seq_tiled', 127, 0, 1, 'sine')
+theta = 3.141592653589793 / 126
+factor = 1 + 4 * (.9 / 4) * (math.cos(theta) - 1)
+assert abs(analytic['sum'] / initial['sum'] - factor ** 25) < 1e-10
 print('All numerical regression and analytic sine mode checks passed.')

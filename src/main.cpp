@@ -5,12 +5,29 @@
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
+static std::uint64_t available_memory() {
+#ifdef _WIN32
+    MEMORYSTATUSEX info{}; info.dwLength=sizeof(info);
+    return GlobalMemoryStatusEx(&info) ? info.ullAvailPhys : 0;
+#else
+    long pages=sysconf(_SC_AVPHYS_PAGES), page_size=sysconf(_SC_PAGESIZE);
+    return pages>0 && page_size>0 ? std::uint64_t(pages)*page_size : 0;
+#endif
+}
 
 struct Options {
     int n=2048, steps=1000, threads=1, tile=64;
@@ -134,10 +151,13 @@ int main(int argc,char** argv) {
         std::vector<int> counts(size),displs(size);
         for(int r=0;r<size;++r) { int rr=o.n/size+(r<o.n%size); int ss=r*(o.n/size)+std::min(r,o.n%size); counts[r]=rr*o.n; displs[r]=ss*o.n; }
         // Two local arrays plus optional root input/output; guard the largest allocation.
-        std::uint64_t bytes=2ULL*(rows+2)*o.n*sizeof(double)+(rank==0 && !o.local_init ? 2ULL*cells*sizeof(double):0);
-        if(bytes>8ULL*1024*1024*1024) throw std::runtime_error("estimated rank allocation exceeds 8 GiB; use --local-init or a smaller grid");
+        std::uint64_t bytes=2ULL*(rows+2)*o.n*sizeof(double)+(rank==0 ? cells*sizeof(double)*(o.verify?2ULL:1ULL):0);
+        std::uint64_t free_bytes=available_memory();
+        if(bytes>8ULL*1024*1024*1024 || (free_bytes && bytes>free_bytes*3/4))
+            throw std::runtime_error("estimated rank allocation exceeds safe available memory; use a smaller grid or more ranks");
         double t0=MPI_Wtime(), comm=0, comp=0;
-        std::vector<double> a(std::size_t(rows+2)*o.n),b(a.size());
+        const std::size_t local_cells=std::size_t(rows+2)*o.n;
+        std::unique_ptr<double[]> a(new double[local_cells]), b(new double[local_cells]);
         // First touch with the same row scheduling used in the compute phase.
         #pragma omp parallel for schedule(static) if(threaded)
         for(int y=0;y<rows+2;++y) for(int x=0;x<o.n;++x) { a[std::size_t(y)*o.n+x]=0; b[std::size_t(y)*o.n+x]=0; }
@@ -145,51 +165,65 @@ int main(int argc,char** argv) {
         if(!o.local_init) {
             if(rank==0) { full.resize(cells); for(int y=0;y<o.n;++y) for(int x=0;x<o.n;++x) full[std::size_t(y)*o.n+x]=initial(y,x,o); }
             double c=MPI_Wtime();
-            MPI_Scatterv(rank==0?full.data():nullptr,counts.data(),displs.data(),MPI_DOUBLE,a.data()+o.n,rows*o.n,MPI_DOUBLE,0,MPI_COMM_WORLD);
+            MPI_Scatterv(rank==0?full.data():nullptr,counts.data(),displs.data(),MPI_DOUBLE,a.get()+o.n,rows*o.n,MPI_DOUBLE,0,MPI_COMM_WORLD);
             comm+=MPI_Wtime()-c;
             full.clear(); full.shrink_to_fit();
         } else {
             #pragma omp parallel for schedule(static) if(threaded)
             for(int y=1;y<=rows;++y) for(int x=0;x<o.n;++x) a[std::size_t(y)*o.n+x]=initial(start+y-1,x,o);
         }
-        std::copy(a.begin()+o.n,a.begin()+std::size_t(rows+1)*o.n,b.begin()+o.n);
+        std::copy(a.get()+o.n,a.get()+std::size_t(rows+1)*o.n,b.get()+o.n);
         double init_time=MPI_Wtime()-t0;
         const double k=o.alpha*o.dt/(o.dx*o.dx);
         const int up=rank==0?MPI_PROC_NULL:rank-1, down=rank==size-1?MPI_PROC_NULL:rank+1;
+        double sample_local[3]={0,0,0}, sample_expected[3]={0,0,0};
         for(int step=0;step<o.steps;++step) {
             if(o.mode=="hybrid_overlap" && size>1) {
                 MPI_Request req[4]; double c=MPI_Wtime();
-                MPI_Irecv(a.data(),o.n,MPI_DOUBLE,up,11,MPI_COMM_WORLD,&req[0]);
-                MPI_Irecv(a.data()+std::size_t(rows+1)*o.n,o.n,MPI_DOUBLE,down,10,MPI_COMM_WORLD,&req[1]);
-                MPI_Isend(a.data()+o.n,o.n,MPI_DOUBLE,up,10,MPI_COMM_WORLD,&req[2]);
-                MPI_Isend(a.data()+std::size_t(rows)*o.n,o.n,MPI_DOUBLE,down,11,MPI_COMM_WORLD,&req[3]);
+                MPI_Irecv(a.get(),o.n,MPI_DOUBLE,up,11,MPI_COMM_WORLD,&req[0]);
+                MPI_Irecv(a.get()+std::size_t(rows+1)*o.n,o.n,MPI_DOUBLE,down,10,MPI_COMM_WORLD,&req[1]);
+                MPI_Isend(a.get()+o.n,o.n,MPI_DOUBLE,up,10,MPI_COMM_WORLD,&req[2]);
+                MPI_Isend(a.get()+std::size_t(rows)*o.n,o.n,MPI_DOUBLE,down,11,MPI_COMM_WORLD,&req[3]);
                 comm+=MPI_Wtime()-c;
-                c=MPI_Wtime(); update(a.data(),b.data(),2,rows,o.n,start,k,o.tile,tiled,threaded); comp+=MPI_Wtime()-c;
+                c=MPI_Wtime(); update(a.get(),b.get(),2,rows,o.n,start,k,o.tile,tiled,threaded); comp+=MPI_Wtime()-c;
                 c=MPI_Wtime(); MPI_Waitall(4,req,MPI_STATUSES_IGNORE); comm+=MPI_Wtime()-c;
-                c=MPI_Wtime(); update(a.data(),b.data(),1,2,o.n,start,k,o.tile,tiled,threaded);
-                if(rows>1) update(a.data(),b.data(),rows,rows+1,o.n,start,k,o.tile,tiled,threaded);
+                c=MPI_Wtime(); update(a.get(),b.get(),1,2,o.n,start,k,o.tile,tiled,threaded);
+                if(rows>1) update(a.get(),b.get(),rows,rows+1,o.n,start,k,o.tile,tiled,threaded);
                 comp+=MPI_Wtime()-c;
             } else {
                 if(size>1) {
                     double c=MPI_Wtime();
-                    MPI_Sendrecv(a.data()+o.n,o.n,MPI_DOUBLE,up,10,a.data()+std::size_t(rows+1)*o.n,o.n,MPI_DOUBLE,down,10,MPI_COMM_WORLD,MPI_STATUS_IGNORE);
-                    MPI_Sendrecv(a.data()+std::size_t(rows)*o.n,o.n,MPI_DOUBLE,down,11,a.data(),o.n,MPI_DOUBLE,up,11,MPI_COMM_WORLD,MPI_STATUS_IGNORE);
+                    MPI_Sendrecv(a.get()+o.n,o.n,MPI_DOUBLE,up,10,a.get()+std::size_t(rows+1)*o.n,o.n,MPI_DOUBLE,down,10,MPI_COMM_WORLD,MPI_STATUS_IGNORE);
+                    MPI_Sendrecv(a.get()+std::size_t(rows)*o.n,o.n,MPI_DOUBLE,down,11,a.get(),o.n,MPI_DOUBLE,up,11,MPI_COMM_WORLD,MPI_STATUS_IGNORE);
                     comm+=MPI_Wtime()-c;
                 }
-                double c=MPI_Wtime(); update(a.data(),b.data(),1,rows+1,o.n,start,k,o.tile,tiled,threaded); comp+=MPI_Wtime()-c;
+                double c=MPI_Wtime(); update(a.get(),b.get(),1,rows+1,o.n,start,k,o.tile,tiled,threaded); comp+=MPI_Wtime()-c;
+            }
+            if(step==o.steps-1) for(int q=0;q<3;++q) {
+                int gy=std::clamp((q+1)*o.n/4,1,o.n-2), x=gy;
+                if(gy>=start && gy<start+rows) {
+                    int y=gy-start+1; auto p=std::size_t(y)*o.n+x;
+                    sample_local[q]=a[p]+k*(a[p-o.n]+a[p+o.n]+a[p-1]+a[p+1]-4*a[p]);
+                }
             }
             a.swap(b);
         }
         double c=MPI_Wtime();
         if(rank==0) full.resize(cells);
-        MPI_Gatherv(a.data()+o.n,rows*o.n,MPI_DOUBLE,rank==0?full.data():nullptr,counts.data(),displs.data(),MPI_DOUBLE,0,MPI_COMM_WORLD);
+        MPI_Gatherv(a.get()+o.n,rows*o.n,MPI_DOUBLE,rank==0?full.data():nullptr,counts.data(),displs.data(),MPI_DOUBLE,0,MPI_COMM_WORLD);
+        MPI_Reduce(sample_local,sample_expected,3,MPI_DOUBLE,MPI_SUM,0,MPI_COMM_WORLD);
         comm+=MPI_Wtime()-c;
         double elapsed=MPI_Wtime()-t0, timing[4]={init_time,comm,comp,elapsed}, maxima[4];
         MPI_Reduce(timing,maxima,4,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
         if(rank==0) {
             double sum=0,mn=std::numeric_limits<double>::infinity(),mx=-mn;
             for(double v:full) { sum+=v; mn=std::min(mn,v); mx=std::max(mx,v); }
-            double err=0, analytic_error=0;
+            double err=0, analytic_error=0, sample_error=0;
+            if(o.steps>0) for(int q=0;q<3;++q) {
+                int y=std::clamp((q+1)*o.n/4,1,o.n-2);
+                sample_error=std::max(sample_error,std::abs(full[std::size_t(y)*o.n+y]-sample_expected[q]));
+            }
+            if(sample_error>1e-10) status=2;
             if(o.init=="sine") {
                 double theta=std::acos(-1.0)/(o.n-1), factor=1+4*k*(std::cos(theta)-1);
                 double amplitude=std::pow(factor,o.steps);
@@ -207,13 +241,15 @@ int main(int argc,char** argv) {
                 if(err>1e-10) status=2;
             }
             if(!o.dump.empty()) {
+                auto parent=std::filesystem::path(o.dump).parent_path();
+                if(!parent.empty()) std::filesystem::create_directories(parent);
                 std::ofstream out(o.dump); if(!out) throw std::runtime_error("cannot write dump");
                 out<<"y,x,temperature\n"; int stride=std::max(1,o.n/256);
                 for(int y=0;y<o.n;y+=stride) for(int x=0;x<o.n;x+=stride) out<<y<<','<<x<<','<<std::setprecision(17)<<full[std::size_t(y)*o.n+x]<<'\n';
             }
             double updates=double(o.n-2)*(o.n-2)*o.steps;
             std::cout<<std::setprecision(12);
-            if(o.output=="json") std::cout<<"{\"mode\":\""<<o.mode<<"\",\"size\":"<<o.n<<",\"steps\":"<<o.steps<<",\"ranks\":"<<size<<",\"threads\":"<<o.threads<<",\"tile\":"<<o.tile<<",\"init_s\":"<<maxima[0]<<",\"comm_s\":"<<maxima[1]<<",\"compute_s\":"<<maxima[2]<<",\"total_s\":"<<maxima[3]<<",\"gflops\":"<<5*updates/maxima[3]/1e9<<",\"updates_per_s\":"<<updates/maxima[3]<<",\"sum\":"<<sum<<",\"mean\":"<<sum/cells<<",\"min\":"<<mn<<",\"max\":"<<mx<<",\"center\":"<<full[cells/2]<<",\"verify_error\":"<<err<<",\"analytic_error\":"<<analytic_error<<",\"verified\":"<<(o.verify?(status==0?"true":"false"):"null")<<"}\n";
+            if(o.output=="json") std::cout<<"{\"mode\":\""<<o.mode<<"\",\"size\":"<<o.n<<",\"steps\":"<<o.steps<<",\"ranks\":"<<size<<",\"threads\":"<<o.threads<<",\"tile\":"<<o.tile<<",\"init_s\":"<<maxima[0]<<",\"comm_s\":"<<maxima[1]<<",\"compute_s\":"<<maxima[2]<<",\"total_s\":"<<maxima[3]<<",\"gflops\":"<<5*updates/maxima[3]/1e9<<",\"updates_per_s\":"<<updates/maxima[3]<<",\"sum\":"<<sum<<",\"mean\":"<<sum/cells<<",\"min\":"<<mn<<",\"max\":"<<mx<<",\"center\":"<<full[std::size_t(o.n/2)*o.n+o.n/2]<<",\"sample_error\":"<<sample_error<<",\"verify_error\":"<<err<<",\"analytic_error\":"<<analytic_error<<",\"verified\":"<<(o.verify?(status==0?"true":"false"):"null")<<"}\n";
             else std::cout<<o.mode<<','<<o.n<<','<<o.steps<<','<<size<<','<<o.threads<<','<<o.tile<<','<<maxima[0]<<','<<maxima[1]<<','<<maxima[2]<<','<<maxima[3]<<','<<5*updates/maxima[3]/1e9<<','<<updates/maxima[3]<<','<<sum<<','<<sum/cells<<','<<mn<<','<<mx<<','<<err<<'\n';
         }
         MPI_Bcast(&status,1,MPI_INT,0,MPI_COMM_WORLD);
