@@ -62,9 +62,12 @@ python3 scripts/benchmark.py --binary build/heat --quick --repeats 2
 python3 scripts/benchmark.py --binary build/heat --repeats 5
 python3 scripts/plot_results.py results/benchmarks.csv
 python3 scripts/plot_heatmaps.py --binary build/heat
+python3 scripts/generate_report.py
 ```
 
 `verify.py` compares every version against an independent sequential reference to relative tolerance `1e-10`, including uneven strips and a 1024² case, and checks the exact discrete sine-mode decay and total heat decay. The benchmark runner detects logical CPU count, runs a warmup before each configuration, sweeps core splits and tile sizes, and writes only measured results to CSV. The full sweep includes 2048², 4096², and 8192², while `--quick` uses 128² and 256². The naive version runs only on the smallest grid. Use `--cores`, `--modes`, `--tiles`, `--sizes`, and `--steps` to limit a sweep. The plotting script reads one or more measured CSVs and creates time, speedup, efficiency, split, overlap, breakdown, and tile plots in `results/plots/`. `plot_heatmaps.py` runs a small grid at 0, 50, and 200 steps to make a field visualization.
+
+The complete submission report is available as [`docs/PDC_Heat_Diffusion_Project_Report.pdf`](docs/PDC_Heat_Diffusion_Project_Report.pdf). It can be regenerated from the measured CSV files and plots with `python3 scripts/generate_report.py`.
 
 ## Measured results
 
