@@ -1,0 +1,2 @@
+timestamp_utc,mode,size,steps,ranks,threads,tile,repeat,init_s,comm_s,compute_s,total_s,gflops,updates_per_s,sum,mean,min,max,center,sample_error,verify_error,analytic_error
+2026-11-19T05:18:55Z,seq_tiled,8192,5,1,1,64,0,1.4277231,0.1691575,0.67506400001,2.2202735,0.755268438775,151053687.755,332638602.866,4.95670144061,0,99.9993617453,0.562585257636,0,0,0
